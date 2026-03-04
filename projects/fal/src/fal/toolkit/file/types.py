@@ -81,6 +81,7 @@ class FileRepository:
         multipart_chunk_size: int | None = None,
         multipart_max_concurrency: int | None = None,
         object_lifecycle_preference: Optional[dict[str, str]] = None,
+        **kwargs,
     ) -> str:
         raise NotImplementedError()
 
@@ -93,6 +94,7 @@ class FileRepository:
         multipart_chunk_size: int | None = None,
         multipart_max_concurrency: int | None = None,
         object_lifecycle_preference: Optional[dict[str, str]] = None,
+        **kwargs,
     ) -> tuple[str, FileData | None]:
         if multipart:
             raise NotImplementedError()

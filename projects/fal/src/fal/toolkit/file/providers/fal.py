@@ -3,15 +3,20 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import mimetypes
 import os
+import string
 import threading
+import uuid
 from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, Generator, Generic, TypeVar
+from random import choice
+from typing import Any, AsyncGenerator, Coroutine, Dict, Generator, Generic, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
@@ -35,6 +40,28 @@ MAX_ATTEMPTS = 5
 BASE_DELAY = 0.1
 MAX_DELAY = 30
 RETRY_CODES = [408, 409, 429, 500, 502, 503, 504]
+
+# Known MIME type -> extension mappings for types we commonly handle.
+# Checked BEFORE mimetypes.guess_extension to avoid depending on the
+# runner's OS-level MIME database, which may be incomplete.
+_MIME_EXTENSION_MAP: dict[str, str] = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/avif": ".avif",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/flac": ".flac",
+    "audio/aac": ".aac",
+    "audio/m4a": ".m4a",
+    "audio/wav": ".wav",
+}
 
 
 def _should_retry(exc: Exception) -> bool:
@@ -92,11 +119,11 @@ def _should_retry_httpx(exc: Exception) -> bool:
 async def _maybe_retry_request_async(
     request: httpx.Request,
     **kwargs: Any,
-) -> AsyncGenerator[Any, None]:
+) -> AsyncGenerator[httpx.Response, None]:
     timeout = kwargs.pop("timeout", DEFAULT_REQUEST_TIMEOUT)
     client = httpx.AsyncClient(timeout=timeout)
 
-    async def _do_request() -> Any:
+    async def _do_request() -> httpx.Response:
         response = await client.send(request, **kwargs)
         response.raise_for_status()
         return response
@@ -137,6 +164,18 @@ def _caller_cdn_token_header(
     if current_app and current_app.current_request:
         if cdn_token := current_app.current_request.headers.get("x-fal-cdn-token"):
             headers["X-Fal-CDN-Token"] = cdn_token
+
+
+def get_random_filename_for_mime_type(mime_type: str, num_chars: int = 8) -> str:
+    """Generate a random filename for a given mime type."""
+    alphanumeric = list(string.ascii_letters + string.digits)
+    name = "".join(choice(alphanumeric) for _ in range(num_chars))
+    extension = (
+        _MIME_EXTENSION_MAP.get(mime_type)
+        or mimetypes.guess_extension(mime_type)
+        or ".bin"
+    )
+    return f"{name}{extension}"
 
 
 @dataclass
@@ -1215,6 +1254,86 @@ class InternalMultipartUploadV3:
 
         return multipart.complete()
 
+    async def async_create(
+        self, object_lifecycle_preference: dict[str, str] | None = None
+    ) -> None:
+        token = fal_v3_token_manager.get_token()
+        try:
+            headers = {
+                **self.auth_headers,
+                "Accept": "application/json",
+                "Content-Type": self.content_type,
+                "X-Fal-File-Name": self.file_name,
+            }
+            _object_lifecycle_headers(headers, object_lifecycle_preference)
+            req = httpx.Request(
+                url=f"{token.base_upload_url}/files/upload/multipart",
+                method="POST",
+                headers=headers,
+            )
+            async with _maybe_retry_request_async(req) as response:
+                result = response.json()
+                self._access_url = result["access_url"]
+                self._upload_id = result["uploadId"]
+
+        except httpx.HTTPStatusError as exc:
+            raise FileUploadException(
+                "Error initiating upload. "
+                f"Status {exc.response.status_code}: {exc.response.text}"
+            )
+
+    async def async_upload_part(self, part_number: int, data: bytes) -> None:
+        url = f"{self.access_url}/multipart/{self.upload_id}/{part_number}"
+
+        req = httpx.Request(
+            url=url,
+            method="PUT",
+            headers={
+                **self.auth_headers,
+                "Content-Type": self.content_type,
+            },
+            content=data,
+        )
+
+        try:
+            async with _maybe_retry_request_async(
+                req, timeout=PUT_REQUEST_TIMEOUT
+            ) as resp:
+                self._parts.append(
+                    {
+                        "partNumber": part_number,
+                        "etag": resp.headers["ETag"],
+                    }
+                )
+        except httpx.HTTPStatusError as exc:
+            raise FileUploadException(
+                f"Error uploading part {part_number} to {url}. "
+                f"Status {exc.response.status_code}: {exc.response.text}"
+            )
+
+    async def async_complete(self) -> str:
+        url = f"{self.access_url}/multipart/{self.upload_id}/complete"
+        try:
+            req = httpx.Request(
+                url=url,
+                method="POST",
+                headers={
+                    **self.auth_headers,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                content=json.dumps({"parts": self._parts}).encode(),
+            )
+            async with _maybe_retry_request_async(req) as resp:
+                _ = resp.json()
+        except httpx.HTTPStatusError as e:
+            raise FileUploadException(
+                "Error completing upload {url}. "
+                f"Status {e.response.status_code}: {e.response.text}"
+            )
+
+        return self.access_url
+
     @classmethod
     async def async_save(
         cls,
@@ -1229,23 +1348,73 @@ class InternalMultipartUploadV3:
             content_type=file.content_type,
             max_concurrency=max_concurrency,
         )
-        multipart.create(object_lifecycle_preference=object_lifecycle_preference)
+        await multipart.async_create(
+            object_lifecycle_preference=object_lifecycle_preference
+        )
 
         parts = math.ceil(len(file.data) / multipart.chunk_size)
-        semaphore = asyncio.Semaphore(multipart.max_concurrency)
+        max_workers = multipart.max_concurrency
+        semaphore = asyncio.Semaphore(
+            max_workers
+        )  # Limit concurrency for async uploads
 
-        async def upload_part(part_number: int, data: bytes) -> None:
+        async def upload_part_async(part_number: int, data: bytes) -> None:
             async with semaphore:
-                multipart.upload_part(part_number, data)
+                await multipart.async_upload_part(part_number, data)
 
         tasks = []
-        for part_number in range(1, parts + 1):
-            start = (part_number - 1) * multipart.chunk_size
-            data = file.data[start : start + multipart.chunk_size]
-            tasks.append(upload_part(part_number, data))
+        async with asyncio.TaskGroup() as task_group:
+            for part_number in range(1, parts + 1):
+                start = (part_number - 1) * multipart.chunk_size
+                data = file.data[start : start + multipart.chunk_size]
+                task_group.create_task(upload_part_async(part_number, data))
+                tasks.append(task_group)
 
-        _ = await asyncio.gather(*tasks, return_exceptions=True)
-        return multipart.complete()
+        return await multipart.async_complete()
+
+    @classmethod
+    async def async_save_file(
+        cls,
+        file_path: str | Path,
+        chunk_size: int | None = None,
+        content_type: str | None = None,
+        max_concurrency: int | None = None,
+        object_lifecycle_preference: dict[str, str] | None = None,
+    ) -> str:
+        file_name = os.path.basename(file_path)
+        size = os.path.getsize(file_path)
+
+        multipart = cls(
+            file_name,
+            chunk_size=chunk_size,
+            content_type=content_type,
+            max_concurrency=max_concurrency,
+        )
+        await multipart.async_create(
+            object_lifecycle_preference=object_lifecycle_preference
+        )
+
+        parts = math.ceil(size / multipart.chunk_size)
+        max_workers = multipart.max_concurrency
+        semaphore = asyncio.Semaphore(
+            max_workers
+        )  # Limit concurrency for async uploads
+
+        async def upload_part_async(part_number: int) -> None:
+            async with semaphore:
+                await multipart.async_upload_part(part_number, data)
+
+        tasks = []
+        async with asyncio.TaskGroup() as task_group:
+            with open(file_path, "rb") as f:
+                for part_number in range(1, parts + 1):
+                    start = (part_number - 1) * multipart.chunk_size
+                    f.seek(start)
+                    data = f.read(multipart.chunk_size)
+                    task_group.create_task(upload_part_async(part_number))
+                    tasks.append(task_group)
+
+        return await multipart.async_complete()
 
 
 @dataclass
@@ -1530,6 +1699,9 @@ class InternalFalFileRepositoryV3(FileRepository):
     That way it can avoid the need to refresh the token for every upload.
     """
 
+    upload_headers: dict[str, dict[str, str]] = field(default_factory=dict)
+    thread_pool: ThreadPoolExecutor = field(default_factory=ThreadPoolExecutor)
+
     def save(
         self,
         file: FileData,
@@ -1625,6 +1797,53 @@ class InternalFalFileRepositoryV3(FileRepository):
 
         return url, data
 
+    def prepare_access_url(
+        self,
+        content_type: str = "image/jpeg",
+        object_lifecycle_preference: dict[str, str] | None = None,
+        file_name: str | None = None,
+    ) -> Coroutine[Any, Any, tuple[str, str]]:
+        id = str(uuid.uuid4())
+        _file_name = file_name or get_random_filename_for_mime_type(content_type)
+
+        headers = {
+            "Content-Type": content_type,
+            "Accept": "application/json",
+            "X-Fal-File-Name": _file_name,
+            **self.auth_headers,
+        }
+
+        _object_lifecycle_headers(headers, object_lifecycle_preference)
+
+        async def _prepare() -> tuple[str, str]:
+            async with _maybe_retry_request_async(
+                request=httpx.Request(
+                    url=_FAL_CDN_V3 + "files/upload?async=1",
+                    method="POST",
+                    headers=headers,
+                )
+            ) as response:
+                result = response.json()
+                access_url: str = result["access_url"]
+                upload_id: str = result["upload_id"]
+
+            # Store upload metadata for later use in upload_blob_multipart
+            self.upload_headers[id] = {
+                "Content-Type": content_type,
+                "upload_id": upload_id,
+                "access_url": access_url,
+            }
+
+            return id, access_url
+
+        return _prepare()
+
+    async def prepare_sync_access_url(self) -> tuple[str, str | None]:
+        """
+        Create a data URI for a given file.
+        """
+        return (str(uuid.uuid4()), None)
+
     async def async_save(
         self,
         data: FileData,
@@ -1633,6 +1852,8 @@ class InternalFalFileRepositoryV3(FileRepository):
         multipart_chunk_size: int | None = None,
         multipart_max_concurrency: int | None = None,
         object_lifecycle_preference: Dict[str, str] | None = None,
+        wait_for_upload: bool = True,
+        **kwargs,
     ) -> str:
         if multipart is None:
             threshold = (
@@ -1657,17 +1878,49 @@ class InternalFalFileRepositoryV3(FileRepository):
 
         _object_lifecycle_headers(headers, object_lifecycle_preference)
 
-        url = os.getenv("FAL_CDN_V3_HOST", _FAL_CDN_V3) + "/files/upload"
-        request = httpx.Request(
-            method="POST", url=url, headers=headers, content=data.data
+        upload_id, access_url = await self.prepare_access_url(
+            content_type=data.content_type,
+            file_name=data.file_name,
+            object_lifecycle_preference=object_lifecycle_preference,
         )
-        try:
-            async with _maybe_retry_request_async(request) as response:
-                result = json.load(response)
-        except HTTPError as e:
+
+        if upload_id not in self.upload_headers:
             raise FileUploadException(
-                f"Error initiating upload. Status {e.status}: {e.reason}"
+                f"No upload metadata found for upload ID {upload_id}. If you are ",
+                "providing an access_url_future, make sure it was generated ",
+                "by this repository instance.",
+            )
+        headers.update(self.upload_headers.pop(upload_id))
+
+        upload_request = httpx.Request(
+            url=access_url,
+            content=data.data,
+            headers=headers,
+            method="PUT",
+        )
+
+        try:
+            if not wait_for_upload:
+                async with _maybe_retry_request_async(upload_request) as response:
+                    _ = response.json()
+            else:
+
+                async def _do_upload() -> None:
+                    async with _maybe_retry_request_async(upload_request) as response:
+                        _ = response.json()
+
+                def _upload_done_callback(fut: asyncio.Future) -> None:
+                    if fut.exception():
+                        print(f"Error uploading file: {fut.exception()}")
+                    else:
+                        print(f"File uploaded successfully to {access_url}")
+
+                upload_task = asyncio.create_task(_do_upload())
+                upload_task.add_done_callback(_upload_done_callback)
+        except httpx.HTTPStatusError as e:
+            raise FileUploadException(
+                "Error uploading file. ",
+                f"Status {e.response.status_code}: {e.response.text}",
             )
 
-        access_url = result["access_url"]
         return access_url
