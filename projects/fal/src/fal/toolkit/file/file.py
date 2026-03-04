@@ -403,6 +403,66 @@ class File(BaseModel):
             file_size=file_path.stat().st_size,
         )
 
+    @classmethod
+    async def async_from_path(
+        cls,
+        path: str | Path,
+        content_type: Optional[str] = None,
+        repository: FileRepository | RepositoryId = DEFAULT_REPOSITORY,
+        multipart: bool | None = None,
+        fallback_repository: Optional[
+            FileRepository | RepositoryId | list[FileRepository | RepositoryId]
+        ] = FALLBACK_REPOSITORY,
+        request: Optional[Request] = None,
+        save_kwargs: Optional[dict] = None,
+        fallback_save_kwargs: Optional[dict] = None,
+    ) -> File:
+        file_path = Path(path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File {file_path} does not exist")
+
+        save_kwargs = save_kwargs or {}
+        fallback_save_kwargs = fallback_save_kwargs or {}
+
+        content_type = content_type or "application/octet-stream"
+
+        if request:
+            object_lifecycle_preference = request_lifecycle_preference(request)
+        else:
+            object_lifecycle_preference = (
+                _get_object_lifecycle_preference_from_context()
+            )
+
+        save_kwargs.setdefault(
+            "object_lifecycle_preference", object_lifecycle_preference
+        )
+        fallback_save_kwargs.setdefault(
+            "object_lifecycle_preference", object_lifecycle_preference
+        )
+
+        save_kwargs.setdefault("multipart", multipart)
+        fallback_save_kwargs.setdefault("multipart", multipart)
+
+        save_kwargs.setdefault("content_type", content_type)
+        fallback_save_kwargs.setdefault("content_type", content_type)
+
+        url, data = await _async_try_with_fallback(
+            "save_file",
+            [file_path],
+            repository=repository,
+            fallback_repository=fallback_repository,
+            save_kwargs=save_kwargs,
+            fallback_save_kwargs=fallback_save_kwargs,
+        )
+
+        return cls(
+            url=url,
+            file_data=data.data if data else None,
+            content_type=content_type,
+            file_name=file_path.name,
+            file_size=file_path.stat().st_size,
+        )
+
     def as_bytes(self) -> bytes:
         if self.file_data is None:
             raise ValueError("File has not been downloaded")

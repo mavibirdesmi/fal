@@ -1056,6 +1056,177 @@ class MultipartUploadV3:
 
         return multipart.complete()
 
+    async def async_create(
+        self, object_lifecycle_preference: dict[str, str] | None = None
+    ) -> None:
+        grpc_host = os.environ.get("FAL_HOST", "api.alpha.fal.ai")
+        rest_host = grpc_host.replace("api", "rest", 1)
+        url = f"https://{rest_host}/storage/upload/initiate-multipart?storage_type=fal-cdn-v3"
+
+        try:
+            headers = {
+                **self.auth_headers,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            _object_lifecycle_headers(headers, object_lifecycle_preference)
+            req = httpx.Request(
+                url=url,
+                method="POST",
+                headers=headers,
+                content=json.dumps(
+                    {
+                        "file_name": self.file_name,
+                        "content_type": self.content_type,
+                    }
+                ).encode(),
+            )
+
+            async with _maybe_retry_request_async(req) as response:
+                result = response.json()
+                self._access_url = result["file_url"]
+                self._upload_url = result["upload_url"]
+
+        except httpx.HTTPStatusError as exc:
+            raise FileUploadException(
+                "Error initiating upload. "
+                f"Status {exc.response.status_code}: {exc.response.text}"
+            )
+
+    async def async_upload_part(self, part_number: int, data: bytes) -> None:
+        parsed = urlparse(self.upload_url)
+        part_path = parsed.path + f"/{part_number}"
+        url = urlunparse(parsed._replace(path=part_path))
+
+        req = httpx.Request(
+            url=url,
+            method="PUT",
+            headers={
+                "Content-Type": self.content_type,
+            },
+            content=data,
+        )
+
+        try:
+            async with _maybe_retry_request_async(
+                req, timeout=PUT_REQUEST_TIMEOUT
+            ) as resp:
+                self._parts.append(
+                    {
+                        "partNumber": part_number,
+                        "etag": resp.headers["ETag"],
+                    }
+                )
+        except httpx.HTTPStatusError as exc:
+            raise FileUploadException(
+                f"Error uploading part {part_number} to {url}. "
+                f"Status {exc.response.status_code}: {exc.response.text}"
+            )
+
+    async def async_complete(self) -> str:
+        parsed = urlparse(self.upload_url)
+        complete_path = parsed.path + "/complete"
+        url = urlunparse(parsed._replace(path=complete_path))
+
+        try:
+            req = httpx.Request(
+                url=url,
+                method="POST",
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                content=json.dumps({"parts": self._parts}).encode(),
+            )
+            async with _maybe_retry_request_async(req):
+                pass
+        except httpx.HTTPStatusError as e:
+            raise FileUploadException(
+                f"Error completing upload {url}. "
+                f"Status {e.response.status_code}: {e.response.text}"
+            )
+
+        return self.access_url
+
+    @classmethod
+    async def async_save(
+        cls,
+        file: FileData,
+        chunk_size: int | None = None,
+        max_concurrency: int | None = None,
+        object_lifecycle_preference: dict[str, str] | None = None,
+    ):
+        multipart = cls(
+            file.file_name,
+            chunk_size=chunk_size,
+            content_type=file.content_type,
+            max_concurrency=max_concurrency,
+        )
+        await multipart.async_create(
+            object_lifecycle_preference=object_lifecycle_preference
+        )
+
+        parts = math.ceil(len(file.data) / multipart.chunk_size)
+        semaphore = asyncio.Semaphore(multipart.max_concurrency)
+
+        async def _upload_part(part_number: int, data: bytes) -> None:
+            async with semaphore:
+                await multipart.async_upload_part(part_number, data)
+
+        async with asyncio.TaskGroup() as task_group:
+            for part_number in range(1, parts + 1):
+                start = (part_number - 1) * multipart.chunk_size
+                data = file.data[start : start + multipart.chunk_size]
+                task_group.create_task(_upload_part(part_number, data))
+
+        return await multipart.async_complete()
+
+    @classmethod
+    async def async_save_file(
+        cls,
+        file_path: str | Path,
+        chunk_size: int | None = None,
+        content_type: str | None = None,
+        max_concurrency: int | None = None,
+        object_lifecycle_preference: dict[str, str] | None = None,
+    ) -> str:
+        file_name = os.path.basename(file_path)
+        size = os.path.getsize(file_path)
+
+        multipart = cls(
+            file_name,
+            chunk_size=chunk_size,
+            content_type=content_type,
+            max_concurrency=max_concurrency,
+        )
+        await multipart.async_create(
+            object_lifecycle_preference=object_lifecycle_preference
+        )
+
+        parts = math.ceil(size / multipart.chunk_size)
+        semaphore = asyncio.Semaphore(multipart.max_concurrency)
+
+        async def _upload_part(part_number: int, data: bytes) -> None:
+            async with semaphore:
+                await multipart.async_upload_part(part_number, data)
+
+        def _read_chunks() -> list[tuple[int, bytes]]:
+            chunks = []
+            with open(file_path, "rb") as f:
+                for part_number in range(1, parts + 1):
+                    start = (part_number - 1) * multipart.chunk_size
+                    f.seek(start)
+                    chunks.append((part_number, f.read(multipart.chunk_size)))
+            return chunks
+
+        chunks = await asyncio.to_thread(_read_chunks)
+
+        async with asyncio.TaskGroup() as task_group:
+            for part_number, data in chunks:
+                task_group.create_task(_upload_part(part_number, data))
+
+        return await multipart.async_complete()
+
 
 class InternalMultipartUploadV3:
     MULTIPART_THRESHOLD = 100 * 1024 * 1024
@@ -1682,6 +1853,118 @@ class FalFileRepositoryV3(FileRepository):
                     file_name=os.path.basename(file_path),
                 )
             url = self.save(
+                data,
+                object_lifecycle_preference=object_lifecycle_preference,
+            )
+
+        return url, data
+
+    async def async_save(
+        self,
+        data: FileData,
+        multipart: bool | None = None,
+        multipart_threshold: int | None = None,
+        multipart_chunk_size: int | None = None,
+        multipart_max_concurrency: int | None = None,
+        object_lifecycle_preference: dict[str, str] | None = None,
+        **kwargs,
+    ) -> str:
+        if multipart is None:
+            threshold = multipart_threshold or MultipartUploadV3.MULTIPART_THRESHOLD
+            multipart = len(data.data) > threshold
+
+        if multipart:
+            return await MultipartUploadV3.async_save(
+                data,
+                chunk_size=multipart_chunk_size,
+                max_concurrency=multipart_max_concurrency,
+                object_lifecycle_preference=object_lifecycle_preference,
+            )
+
+        headers = {
+            **self.auth_headers,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        _object_lifecycle_headers(headers, object_lifecycle_preference)
+
+        grpc_host = os.environ.get("FAL_HOST", "api.alpha.fal.ai")
+        rest_host = grpc_host.replace("api", "rest", 1)
+        url = f"https://{rest_host}/storage/upload/initiate?storage_type=fal-cdn-v3"
+
+        initiate_request = httpx.Request(
+            url=url,
+            headers=headers,
+            method="POST",
+            content=json.dumps(
+                {
+                    "file_name": data.file_name,
+                    "content_type": data.content_type,
+                }
+            ).encode(),
+        )
+        try:
+            async with _maybe_retry_request_async(initiate_request) as response:
+                result = response.json()
+                file_url = result["file_url"]
+                upload_url = result["upload_url"]
+        except httpx.HTTPStatusError as e:
+            raise FileUploadException(
+                "Error initiating upload. "
+                f"Status {e.response.status_code}: {e.response.text}"
+            )
+
+        upload_request = httpx.Request(
+            url=upload_url,
+            headers={"Content-Type": data.content_type},
+            method="PUT",
+            content=data.data,
+        )
+        try:
+            async with _maybe_retry_request_async(
+                upload_request, timeout=PUT_REQUEST_TIMEOUT
+            ):
+                pass
+        except httpx.HTTPStatusError as e:
+            raise FileUploadException(
+                "Error uploading file. "
+                f"Status {e.response.status_code}: {e.response.text}"
+            )
+
+        return file_url
+
+    async def async_save_file(
+        self,
+        file_path: str | Path,
+        content_type: str,
+        multipart: bool | None = None,
+        multipart_threshold: int | None = None,
+        multipart_chunk_size: int | None = None,
+        multipart_max_concurrency: int | None = None,
+        object_lifecycle_preference: dict[str, str] | None = None,
+        **kwargs,
+    ) -> tuple[str, FileData | None]:
+        if multipart is None:
+            threshold = multipart_threshold or MultipartUploadV3.MULTIPART_THRESHOLD
+            multipart = os.path.getsize(file_path) > threshold
+
+        if multipart:
+            url = await MultipartUploadV3.async_save_file(
+                file_path,
+                chunk_size=multipart_chunk_size,
+                content_type=content_type,
+                max_concurrency=multipart_max_concurrency,
+                object_lifecycle_preference=object_lifecycle_preference,
+            )
+            data = None
+        else:
+            file_bytes = await asyncio.to_thread(Path(file_path).read_bytes)
+            data = FileData(
+                file_bytes,
+                content_type=content_type,
+                file_name=os.path.basename(file_path),
+            )
+            url = await self.async_save(
                 data,
                 object_lifecycle_preference=object_lifecycle_preference,
             )
