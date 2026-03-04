@@ -9,7 +9,6 @@ import string
 import threading
 import uuid
 from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1700,7 +1699,6 @@ class InternalFalFileRepositoryV3(FileRepository):
     """
 
     upload_headers: dict[str, dict[str, str]] = field(default_factory=dict)
-    thread_pool: ThreadPoolExecutor = field(default_factory=ThreadPoolExecutor)
 
     def save(
         self,
