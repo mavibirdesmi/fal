@@ -864,6 +864,7 @@ class MultipartUploadV3:
         self._upload_url: str | None = None
 
         self._parts: list[dict] = []
+        self.upload_task: asyncio.Task | None = None
 
     @property
     def access_url(self) -> str:
@@ -1155,6 +1156,8 @@ class MultipartUploadV3:
         chunk_size: int | None = None,
         max_concurrency: int | None = None,
         object_lifecycle_preference: dict[str, str] | None = None,
+        wait_for_upload: bool = True,
+        upload_finished_event: asyncio.Event | None = None,
     ):
         multipart = cls(
             file.file_name,
@@ -1167,19 +1170,36 @@ class MultipartUploadV3:
         )
 
         parts = math.ceil(len(file.data) / multipart.chunk_size)
-        semaphore = asyncio.Semaphore(multipart.max_concurrency)
+        max_workers = multipart.max_concurrency
+        semaphore = asyncio.Semaphore(max_workers)
 
-        async def _upload_part(part_number: int, data: bytes) -> None:
+        async def upload_part_async(part_number: int, data: bytes) -> None:
             async with semaphore:
                 await multipart.async_upload_part(part_number, data)
 
-        async with asyncio.TaskGroup() as task_group:
+        async def _upload():
+            pending_uploads = []
             for part_number in range(1, parts + 1):
                 start = (part_number - 1) * multipart.chunk_size
                 data = file.data[start : start + multipart.chunk_size]
-                task_group.create_task(_upload_part(part_number, data))
+                task = asyncio.create_task(upload_part_async(part_number, data))
+                pending_uploads.append(task)
 
-        return await multipart.async_complete()
+            await asyncio.gather(*pending_uploads)
+            await multipart.async_complete()
+            if upload_finished_event:
+                upload_finished_event.set()
+
+        if wait_for_upload:
+            await _upload()
+        else:
+            upload_task = asyncio.create_task(_upload())
+            multipart.upload_task = upload_task
+            upload_task.add_done_callback(
+                lambda t: setattr(multipart, "upload_task", None)
+            )
+
+        return multipart.access_url
 
     @classmethod
     async def async_save_file(
@@ -1189,6 +1209,8 @@ class MultipartUploadV3:
         content_type: str | None = None,
         max_concurrency: int | None = None,
         object_lifecycle_preference: dict[str, str] | None = None,
+        wait_for_upload: bool = True,
+        upload_finished_event: asyncio.Event | None = None,
     ) -> str:
         file_name = os.path.basename(file_path)
         size = os.path.getsize(file_path)
@@ -1204,28 +1226,38 @@ class MultipartUploadV3:
         )
 
         parts = math.ceil(size / multipart.chunk_size)
-        semaphore = asyncio.Semaphore(multipart.max_concurrency)
+        max_workers = multipart.max_concurrency
+        semaphore = asyncio.Semaphore(max_workers)
 
-        async def _upload_part(part_number: int, data: bytes) -> None:
+        async def upload_part_async(part_number: int, data: bytes) -> None:
             async with semaphore:
                 await multipart.async_upload_part(part_number, data)
 
-        def _read_chunks() -> list[tuple[int, bytes]]:
-            chunks = []
+        async def _upload():
+            pending_uploads = []
             with open(file_path, "rb") as f:
                 for part_number in range(1, parts + 1):
                     start = (part_number - 1) * multipart.chunk_size
                     f.seek(start)
-                    chunks.append((part_number, f.read(multipart.chunk_size)))
-            return chunks
+                    data = f.read(multipart.chunk_size)
+                    task = asyncio.create_task(upload_part_async(part_number, data))
+                    pending_uploads.append(task)
 
-        chunks = await asyncio.to_thread(_read_chunks)
+            await asyncio.gather(*pending_uploads)
+            await multipart.async_complete()
+            if upload_finished_event:
+                upload_finished_event.set()
 
-        async with asyncio.TaskGroup() as task_group:
-            for part_number, data in chunks:
-                task_group.create_task(_upload_part(part_number, data))
+        if wait_for_upload:
+            await _upload()
+        else:
+            upload_task = asyncio.create_task(_upload())
+            multipart.upload_task = upload_task
+            upload_task.add_done_callback(
+                lambda t: setattr(multipart, "upload_task", None)
+            )
 
-        return await multipart.async_complete()
+        return multipart.access_url
 
 
 class InternalMultipartUploadV3:
@@ -1248,6 +1280,7 @@ class InternalMultipartUploadV3:
         self._upload_id: str | None = None
 
         self._parts: list[dict] = []
+        self.upload_task: asyncio.Task | None = None
 
     @property
     def access_url(self) -> str:
@@ -1511,6 +1544,8 @@ class InternalMultipartUploadV3:
         chunk_size: int | None = None,
         max_concurrency: int | None = None,
         object_lifecycle_preference: dict[str, str] | None = None,
+        wait_for_upload: bool = True,
+        upload_finished_event: asyncio.Event | None = None,
     ):
         multipart = cls(
             file.file_name,
@@ -1532,15 +1567,30 @@ class InternalMultipartUploadV3:
             async with semaphore:
                 await multipart.async_upload_part(part_number, data)
 
-        tasks = []
-        async with asyncio.TaskGroup() as task_group:
+        async def _upload():
+            pending_uploads = []
             for part_number in range(1, parts + 1):
                 start = (part_number - 1) * multipart.chunk_size
                 data = file.data[start : start + multipart.chunk_size]
-                task_group.create_task(upload_part_async(part_number, data))
-                tasks.append(task_group)
+                task = asyncio.create_task(upload_part_async(part_number, data))
+                pending_uploads.append(task)
 
-        return await multipart.async_complete()
+            await asyncio.gather(*pending_uploads)
+            await multipart.async_complete()
+
+            if upload_finished_event:
+                upload_finished_event.set()
+
+        if wait_for_upload:
+            await _upload()
+        else:
+            upload_task = asyncio.create_task(_upload())
+            multipart.upload_task = upload_task
+            upload_task.add_done_callback(
+                lambda t: setattr(multipart, "upload_task", None)
+            )
+
+        return multipart.access_url
 
     @classmethod
     async def async_save_file(
@@ -1550,6 +1600,8 @@ class InternalMultipartUploadV3:
         content_type: str | None = None,
         max_concurrency: int | None = None,
         object_lifecycle_preference: dict[str, str] | None = None,
+        wait_for_upload: bool = True,
+        upload_finished_event: asyncio.Event | None = None,
     ) -> str:
         file_name = os.path.basename(file_path)
         size = os.path.getsize(file_path)
@@ -1570,21 +1622,36 @@ class InternalMultipartUploadV3:
             max_workers
         )  # Limit concurrency for async uploads
 
-        async def upload_part_async(part_number: int) -> None:
+        async def upload_part_async(part_number: int, data: bytes) -> None:
             async with semaphore:
                 await multipart.async_upload_part(part_number, data)
 
-        tasks = []
-        async with asyncio.TaskGroup() as task_group:
+        async def _upload():
+            pending_uploads = []
             with open(file_path, "rb") as f:
                 for part_number in range(1, parts + 1):
                     start = (part_number - 1) * multipart.chunk_size
                     f.seek(start)
                     data = f.read(multipart.chunk_size)
-                    task_group.create_task(upload_part_async(part_number))
-                    tasks.append(task_group)
+                    task = asyncio.create_task(upload_part_async(part_number, data))
+                    pending_uploads.append(task)
 
-        return await multipart.async_complete()
+            await asyncio.gather(*pending_uploads)
+            await multipart.async_complete()
+
+            if upload_finished_event:
+                upload_finished_event.set()
+
+        if wait_for_upload:
+            await _upload()
+        else:
+            upload_task = asyncio.create_task(_upload())
+            multipart.upload_task = upload_task
+            upload_task.add_done_callback(
+                lambda t: setattr(multipart, "upload_task", None)
+            )
+
+        return multipart.access_url
 
 
 @dataclass
@@ -1738,6 +1805,8 @@ class FalCDNFileRepository(FileRepository):
 
 @dataclass
 class FalFileRepositoryV3(FileRepository):
+    upload_task: asyncio.Task | None = None
+
     @property
     def auth_headers(self) -> dict[str, str]:
         fal_key = key_credentials()
@@ -1867,6 +1936,8 @@ class FalFileRepositoryV3(FileRepository):
         multipart_chunk_size: int | None = None,
         multipart_max_concurrency: int | None = None,
         object_lifecycle_preference: dict[str, str] | None = None,
+        wait_for_upload: bool = True,
+        upload_finished_event: asyncio.Event | None = None,
         **kwargs,
     ) -> str:
         if multipart is None:
@@ -1879,6 +1950,9 @@ class FalFileRepositoryV3(FileRepository):
                 chunk_size=multipart_chunk_size,
                 max_concurrency=multipart_max_concurrency,
                 object_lifecycle_preference=object_lifecycle_preference,
+                wait_for_upload=wait_for_upload,
+                upload_finished_event=upload_finished_event,
+                **kwargs,
             )
 
         headers = {
@@ -1920,16 +1994,32 @@ class FalFileRepositoryV3(FileRepository):
             method="PUT",
             content=data.data,
         )
-        try:
-            async with _maybe_retry_request_async(
-                upload_request, timeout=PUT_REQUEST_TIMEOUT
-            ):
-                pass
-        except httpx.HTTPStatusError as e:
-            raise FileUploadException(
-                "Error uploading file. "
-                f"Status {e.response.status_code}: {e.response.text}"
-            )
+
+        async def _upload():
+            try:
+                async with _maybe_retry_request_async(
+                    upload_request, timeout=PUT_REQUEST_TIMEOUT
+                ):
+                    pass
+            except httpx.HTTPStatusError as e:
+                raise FileUploadException(
+                    "Error uploading file. "
+                    f"Status {e.response.status_code}: {e.response.text}"
+                )
+
+        if wait_for_upload:
+            await _upload()
+        else:
+            upload_task = asyncio.create_task(_upload())
+            self.upload_task = upload_task
+
+            def _upload_done_callback(t: asyncio.Task) -> None:
+                t.result()
+                self.upload_task = None
+                if upload_finished_event:
+                    upload_finished_event.set()
+
+            upload_task.add_done_callback(_upload_done_callback)
 
         return file_url
 
@@ -1942,6 +2032,8 @@ class FalFileRepositoryV3(FileRepository):
         multipart_chunk_size: int | None = None,
         multipart_max_concurrency: int | None = None,
         object_lifecycle_preference: dict[str, str] | None = None,
+        wait_for_upload: bool = True,
+        upload_finished_event: asyncio.Event | None = None,
         **kwargs,
     ) -> tuple[str, FileData | None]:
         if multipart is None:
@@ -1955,6 +2047,8 @@ class FalFileRepositoryV3(FileRepository):
                 content_type=content_type,
                 max_concurrency=multipart_max_concurrency,
                 object_lifecycle_preference=object_lifecycle_preference,
+                wait_for_upload=wait_for_upload,
+                upload_finished_event=upload_finished_event,
             )
             data = None
         else:
@@ -1967,6 +2061,8 @@ class FalFileRepositoryV3(FileRepository):
             url = await self.async_save(
                 data,
                 object_lifecycle_preference=object_lifecycle_preference,
+                wait_for_upload=wait_for_upload,
+                upload_finished_event=upload_finished_event,
             )
 
         return url, data
@@ -1982,6 +2078,7 @@ class InternalFalFileRepositoryV3(FileRepository):
     """
 
     upload_headers: dict[str, dict[str, str]] = field(default_factory=dict)
+    upload_task: asyncio.Task | None = None
 
     def save(
         self,
@@ -2134,6 +2231,7 @@ class InternalFalFileRepositoryV3(FileRepository):
         multipart_max_concurrency: int | None = None,
         object_lifecycle_preference: Dict[str, str] | None = None,
         wait_for_upload: bool = True,
+        upload_finished_event: asyncio.Event | None = None,
         **kwargs,
     ) -> str:
         if multipart is None:
@@ -2143,11 +2241,13 @@ class InternalFalFileRepositoryV3(FileRepository):
             multipart = len(data.data) > threshold
 
         if multipart:
-            return InternalMultipartUploadV3.save(
+            return await InternalMultipartUploadV3.async_save(
                 data,
                 chunk_size=multipart_chunk_size,
                 max_concurrency=multipart_max_concurrency,
                 object_lifecycle_preference=object_lifecycle_preference,
+                wait_for_upload=wait_for_upload,
+                upload_finished_event=upload_finished_event,
             )
 
         headers = {
@@ -2181,7 +2281,7 @@ class InternalFalFileRepositoryV3(FileRepository):
         )
 
         try:
-            if not wait_for_upload:
+            if wait_for_upload:
                 async with _maybe_retry_request_async(upload_request) as response:
                     _ = response.json()
             else:
@@ -2190,13 +2290,16 @@ class InternalFalFileRepositoryV3(FileRepository):
                     async with _maybe_retry_request_async(upload_request) as response:
                         _ = response.json()
 
-                def _upload_done_callback(fut: asyncio.Future) -> None:
-                    if fut.exception():
-                        print(f"Error uploading file: {fut.exception()}")
-                    else:
-                        print(f"File uploaded successfully to {access_url}")
+                def _upload_done_callback(t: asyncio.Task) -> None:
+                    try:
+                        t.result()
+                    finally:
+                        self.upload_task = None
+                        if upload_finished_event:
+                            upload_finished_event.set()
 
                 upload_task = asyncio.create_task(_do_upload())
+                self.upload_task = upload_task
                 upload_task.add_done_callback(_upload_done_callback)
         except httpx.HTTPStatusError as e:
             raise FileUploadException(

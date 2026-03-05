@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 import traceback
 from functools import wraps
@@ -62,6 +63,8 @@ get_builtin_repository.__module__ = "__main__"
 DEFAULT_REPOSITORY: FileRepository | RepositoryId = "fal_v3"
 FALLBACK_REPOSITORY: list[FileRepository | RepositoryId] = ["cdn", "fal"]
 OBJECT_LIFECYCLE_PREFERENCE_KEY = "x-fal-object-lifecycle-preference"
+
+NONBLOCKING_UPLOAD_TIMEOUT = 5 * 60  # 5 minutes
 
 
 @wraps(Field)
@@ -192,6 +195,11 @@ class File(BaseModel):
         exclude=True,
         repr=False,
     )
+    is_upload_finished: bool = Field(
+        default=True,
+        description="Indicates whether the file upload has finished. "
+        "This is only relevant for async file creation with wait_for_upload=False.",
+    )
 
     # Pydantic custom validator for input type conversion
     if IS_PYDANTIC_V2:
@@ -306,6 +314,7 @@ class File(BaseModel):
         request: Optional[Request] = None,
         save_kwargs: Optional[dict] = None,
         fallback_save_kwargs: Optional[dict] = None,
+        wait_for_upload: bool = True,
     ) -> File:
         save_kwargs = save_kwargs or {}
         fallback_save_kwargs = fallback_save_kwargs or {}
@@ -326,6 +335,14 @@ class File(BaseModel):
             "object_lifecycle_preference", object_lifecycle_preference
         )
 
+        save_kwargs.setdefault("wait_for_upload", wait_for_upload)
+        fallback_save_kwargs.setdefault("wait_for_upload", wait_for_upload)
+
+        upload_finished_event = asyncio.Event()
+        if not wait_for_upload:
+            save_kwargs["upload_finished_event"] = upload_finished_event
+            fallback_save_kwargs["upload_finished_event"] = upload_finished_event
+
         url = await _async_try_with_fallback(
             "save",
             [fdata],
@@ -334,14 +351,31 @@ class File(BaseModel):
             save_kwargs=save_kwargs,
             fallback_save_kwargs=fallback_save_kwargs,
         )
-
-        return cls(
+        file_obj = cls(
             url=url,
             content_type=fdata.content_type,
             file_name=fdata.file_name,
             file_size=len(data),
             file_data=data,
+            is_upload_finished=wait_for_upload,
         )
+
+        if not wait_for_upload:
+
+            async def _wait_for_upload():
+                await asyncio.wait_for(
+                    upload_finished_event.wait(), timeout=NONBLOCKING_UPLOAD_TIMEOUT
+                )
+
+            def _monitor_done_callback(task: asyncio.Task):
+                task.result()
+                file_obj.is_upload_finished = True
+
+            asyncio.create_task(_wait_for_upload()).add_done_callback(
+                _monitor_done_callback
+            )
+
+        return file_obj
 
     @classmethod
     def from_path(
@@ -416,6 +450,7 @@ class File(BaseModel):
         request: Optional[Request] = None,
         save_kwargs: Optional[dict] = None,
         fallback_save_kwargs: Optional[dict] = None,
+        wait_for_upload: bool = True,
     ) -> File:
         file_path = Path(path)
         if not file_path.exists():
@@ -446,6 +481,14 @@ class File(BaseModel):
         save_kwargs.setdefault("content_type", content_type)
         fallback_save_kwargs.setdefault("content_type", content_type)
 
+        save_kwargs.setdefault("wait_for_upload", wait_for_upload)
+        fallback_save_kwargs.setdefault("wait_for_upload", wait_for_upload)
+
+        upload_finished_event = asyncio.Event()
+        if not wait_for_upload:
+            save_kwargs["upload_finished_event"] = upload_finished_event
+            fallback_save_kwargs["upload_finished_event"] = upload_finished_event
+
         url, data = await _async_try_with_fallback(
             "save_file",
             [file_path],
@@ -455,13 +498,31 @@ class File(BaseModel):
             fallback_save_kwargs=fallback_save_kwargs,
         )
 
-        return cls(
+        file_obj = cls(
             url=url,
             file_data=data.data if data else None,
             content_type=content_type,
             file_name=file_path.name,
             file_size=file_path.stat().st_size,
+            is_upload_finished=wait_for_upload,
         )
+
+        if not wait_for_upload:
+
+            async def _wait_for_upload():
+                await asyncio.wait_for(
+                    upload_finished_event.wait(), timeout=NONBLOCKING_UPLOAD_TIMEOUT
+                )
+
+            def _monitor_done_callback(task: asyncio.Task):
+                task.result()
+                file_obj.is_upload_finished = True
+
+            asyncio.create_task(_wait_for_upload()).add_done_callback(
+                _monitor_done_callback
+            )
+
+        return file_obj
 
     def as_bytes(self) -> bytes:
         if self.file_data is None:
