@@ -1208,12 +1208,6 @@ class MultipartUploadV3:
             def _upload_done_callback(t: asyncio.Task) -> None:
                 try:
                     t.result()
-                except FileUploadException as e:
-                    raise e
-                except Exception as e:
-                    raise FileUploadException(
-                        f"Error during file upload: {str(e)}"
-                    ) from e
                 finally:
                     multipart.upload_task = None
                     if upload_finished_event:
@@ -1287,12 +1281,6 @@ class MultipartUploadV3:
             def _upload_done_callback(t: asyncio.Task) -> None:
                 try:
                     t.result()
-                except FileUploadException as e:
-                    raise e
-                except Exception as e:
-                    raise FileUploadException(
-                        f"Error during file upload: {str(e)}"
-                    ) from e
                 finally:
                     multipart.upload_task = None
                     if upload_finished_event:
@@ -1641,12 +1629,6 @@ class InternalMultipartUploadV3:
             def _upload_done_callback(t: asyncio.Task) -> None:
                 try:
                     t.result()
-                except FileUploadException as e:
-                    raise e
-                except Exception as e:
-                    raise FileUploadException(
-                        f"Error during file upload: {str(e)}"
-                    ) from e
                 finally:
                     multipart.upload_task = None
                     if upload_finished_event:
@@ -1720,12 +1702,6 @@ class InternalMultipartUploadV3:
             def _upload_done_callback(t: asyncio.Task) -> None:
                 try:
                     t.result()
-                except FileUploadException as e:
-                    raise e
-                except Exception as e:
-                    raise FileUploadException(
-                        f"Error during file upload: {str(e)}"
-                    ) from e
                 finally:
                     multipart.upload_task = None
                     if upload_finished_event:

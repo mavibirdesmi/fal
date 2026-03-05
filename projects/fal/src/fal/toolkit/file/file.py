@@ -201,6 +201,8 @@ class File(BaseModel):
         "This is only relevant for async file creation with wait_for_upload=False.",
     )
 
+    _upload_monitor_task: Optional[asyncio.Task] = None
+
     # Pydantic custom validator for input type conversion
     if IS_PYDANTIC_V2:
 
@@ -368,12 +370,15 @@ class File(BaseModel):
                 )
 
             def _monitor_done_callback(task: asyncio.Task):
-                task.result()
-                file_obj.is_upload_finished = True
+                try:
+                    task.result()
+                finally:
+                    file_obj.is_upload_finished = True
+                    file_obj._upload_monitor_task = None
 
-            asyncio.create_task(_wait_for_upload()).add_done_callback(
-                _monitor_done_callback
-            )
+            upload_monitor_task = asyncio.create_task(_wait_for_upload())
+            upload_monitor_task.add_done_callback(_monitor_done_callback)
+            file_obj._upload_monitor_task = upload_monitor_task
 
         return file_obj
 
@@ -515,12 +520,15 @@ class File(BaseModel):
                 )
 
             def _monitor_done_callback(task: asyncio.Task):
-                task.result()
-                file_obj.is_upload_finished = True
+                try:
+                    task.result()
+                finally:
+                    file_obj.is_upload_finished = True
+                    file_obj._upload_monitor_task = None
 
-            asyncio.create_task(_wait_for_upload()).add_done_callback(
-                _monitor_done_callback
-            )
+            upload_monitor_task = asyncio.create_task(_wait_for_upload())
+            upload_monitor_task.add_done_callback(_monitor_done_callback)
+            file_obj._upload_monitor_task = upload_monitor_task
 
         return file_obj
 
