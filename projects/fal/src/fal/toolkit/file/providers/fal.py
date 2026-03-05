@@ -1188,16 +1188,10 @@ class MultipartUploadV3:
 
             await asyncio.gather(*pending_uploads)
             await multipart.async_complete()
-            if upload_finished_event:
-                upload_finished_event.set()
 
         if wait_for_upload:
             try:
                 await _upload()
-            except FileUploadException as e:
-                raise e
-            except Exception as e:
-                raise FileUploadException(f"Error during file upload: {str(e)}") from e
             finally:
                 if upload_finished_event:
                     upload_finished_event.set()
@@ -1261,16 +1255,10 @@ class MultipartUploadV3:
 
             await asyncio.gather(*pending_uploads)
             await multipart.async_complete()
-            if upload_finished_event:
-                upload_finished_event.set()
 
         if wait_for_upload:
             try:
                 await _upload()
-            except FileUploadException as e:
-                raise e
-            except Exception as e:
-                raise FileUploadException(f"Error during file upload: {str(e)}") from e
             finally:
                 if upload_finished_event:
                     upload_finished_event.set()
@@ -1615,10 +1603,6 @@ class InternalMultipartUploadV3:
         if wait_for_upload:
             try:
                 await _upload()
-            except FileUploadException as e:
-                raise e
-            except Exception as e:
-                raise FileUploadException(f"Error during file upload: {str(e)}") from e
             finally:
                 if upload_finished_event:
                     upload_finished_event.set()
@@ -1688,10 +1672,6 @@ class InternalMultipartUploadV3:
         if wait_for_upload:
             try:
                 await _upload()
-            except FileUploadException as e:
-                raise e
-            except Exception as e:
-                raise FileUploadException(f"Error during file upload: {str(e)}") from e
             finally:
                 if upload_finished_event:
                     upload_finished_event.set()
@@ -2064,6 +2044,9 @@ class FalFileRepositoryV3(FileRepository):
                     "Error uploading file. "
                     f"Status {e.response.status_code}: {e.response.text}"
                 )
+            finally:
+                if upload_finished_event:
+                    upload_finished_event.set()
 
         if wait_for_upload:
             await _upload()
@@ -2076,8 +2059,6 @@ class FalFileRepositoryV3(FileRepository):
                     t.result()
                 finally:
                     self.upload_task = None
-                    if upload_finished_event:
-                        upload_finished_event.set()
 
             upload_task.add_done_callback(_upload_done_callback)
 
@@ -2340,31 +2321,33 @@ class InternalFalFileRepositoryV3(FileRepository):
             method="PUT",
         )
 
-        try:
-            if wait_for_upload:
-                async with _maybe_retry_request_async(upload_request) as response:
-                    _ = response.json()
-            else:
+        async def _upload():
+            try:
+                async with _maybe_retry_request_async(
+                    upload_request, timeout=PUT_REQUEST_TIMEOUT
+                ):
+                    pass
+            except httpx.HTTPStatusError as e:
+                raise FileUploadException(
+                    "Error uploading file. "
+                    f"Status {e.response.status_code}: {e.response.text}"
+                )
+            finally:
+                if upload_finished_event:
+                    upload_finished_event.set()
 
-                async def _do_upload() -> None:
-                    async with _maybe_retry_request_async(upload_request) as response:
-                        _ = response.json()
+        if wait_for_upload:
+            await _upload()
+        else:
+            upload_task = asyncio.create_task(_upload())
+            self.upload_task = upload_task
 
-                def _upload_done_callback(t: asyncio.Task) -> None:
-                    try:
-                        t.result()
-                    finally:
-                        self.upload_task = None
-                        if upload_finished_event:
-                            upload_finished_event.set()
+            def _upload_done_callback(t: asyncio.Task) -> None:
+                try:
+                    t.result()
+                finally:
+                    self.upload_task = None
 
-                upload_task = asyncio.create_task(_do_upload())
-                self.upload_task = upload_task
-                upload_task.add_done_callback(_upload_done_callback)
-        except httpx.HTTPStatusError as e:
-            raise FileUploadException(
-                "Error uploading file. ",
-                f"Status {e.response.status_code}: {e.response.text}",
-            )
+            upload_task.add_done_callback(_upload_done_callback)
 
         return access_url
