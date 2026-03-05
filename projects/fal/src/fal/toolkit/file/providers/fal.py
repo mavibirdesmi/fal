@@ -141,6 +141,7 @@ async def _maybe_retry_request_async(
         yield response
     finally:
         await response.aclose()
+        await client.aclose()
 
 
 def _object_lifecycle_headers(
@@ -1191,13 +1192,34 @@ class MultipartUploadV3:
                 upload_finished_event.set()
 
         if wait_for_upload:
-            await _upload()
+            try:
+                await _upload()
+            except FileUploadException as e:
+                raise e
+            except Exception as e:
+                raise FileUploadException(f"Error during file upload: {str(e)}") from e
+            finally:
+                if upload_finished_event:
+                    upload_finished_event.set()
         else:
             upload_task = asyncio.create_task(_upload())
             multipart.upload_task = upload_task
-            upload_task.add_done_callback(
-                lambda t: setattr(multipart, "upload_task", None)
-            )
+
+            def _upload_done_callback(t: asyncio.Task) -> None:
+                try:
+                    t.result()
+                except FileUploadException as e:
+                    raise e
+                except Exception as e:
+                    raise FileUploadException(
+                        f"Error during file upload: {str(e)}"
+                    ) from e
+                finally:
+                    multipart.upload_task = None
+                    if upload_finished_event:
+                        upload_finished_event.set()
+
+            upload_task.add_done_callback(_upload_done_callback)
 
         return multipart.access_url
 
@@ -1249,13 +1271,34 @@ class MultipartUploadV3:
                 upload_finished_event.set()
 
         if wait_for_upload:
-            await _upload()
+            try:
+                await _upload()
+            except FileUploadException as e:
+                raise e
+            except Exception as e:
+                raise FileUploadException(f"Error during file upload: {str(e)}") from e
+            finally:
+                if upload_finished_event:
+                    upload_finished_event.set()
         else:
             upload_task = asyncio.create_task(_upload())
             multipart.upload_task = upload_task
-            upload_task.add_done_callback(
-                lambda t: setattr(multipart, "upload_task", None)
-            )
+
+            def _upload_done_callback(t: asyncio.Task) -> None:
+                try:
+                    t.result()
+                except FileUploadException as e:
+                    raise e
+                except Exception as e:
+                    raise FileUploadException(
+                        f"Error during file upload: {str(e)}"
+                    ) from e
+                finally:
+                    multipart.upload_task = None
+                    if upload_finished_event:
+                        upload_finished_event.set()
+
+            upload_task.add_done_callback(_upload_done_callback)
 
         return multipart.access_url
 
@@ -1531,7 +1574,7 @@ class InternalMultipartUploadV3:
                 _ = resp.json()
         except httpx.HTTPStatusError as e:
             raise FileUploadException(
-                "Error completing upload {url}. "
+                f"Error completing upload {url}. "
                 f"Status {e.response.status_code}: {e.response.text}"
             )
 
@@ -1582,13 +1625,34 @@ class InternalMultipartUploadV3:
                 upload_finished_event.set()
 
         if wait_for_upload:
-            await _upload()
+            try:
+                await _upload()
+            except FileUploadException as e:
+                raise e
+            except Exception as e:
+                raise FileUploadException(f"Error during file upload: {str(e)}") from e
+            finally:
+                if upload_finished_event:
+                    upload_finished_event.set()
         else:
             upload_task = asyncio.create_task(_upload())
             multipart.upload_task = upload_task
-            upload_task.add_done_callback(
-                lambda t: setattr(multipart, "upload_task", None)
-            )
+
+            def _upload_done_callback(t: asyncio.Task) -> None:
+                try:
+                    t.result()
+                except FileUploadException as e:
+                    raise e
+                except Exception as e:
+                    raise FileUploadException(
+                        f"Error during file upload: {str(e)}"
+                    ) from e
+                finally:
+                    multipart.upload_task = None
+                    if upload_finished_event:
+                        upload_finished_event.set()
+
+            upload_task.add_done_callback(_upload_done_callback)
 
         return multipart.access_url
 
@@ -1639,17 +1703,35 @@ class InternalMultipartUploadV3:
             await asyncio.gather(*pending_uploads)
             await multipart.async_complete()
 
-            if upload_finished_event:
-                upload_finished_event.set()
-
         if wait_for_upload:
-            await _upload()
+            try:
+                await _upload()
+            except FileUploadException as e:
+                raise e
+            except Exception as e:
+                raise FileUploadException(f"Error during file upload: {str(e)}") from e
+            finally:
+                if upload_finished_event:
+                    upload_finished_event.set()
         else:
             upload_task = asyncio.create_task(_upload())
             multipart.upload_task = upload_task
-            upload_task.add_done_callback(
-                lambda t: setattr(multipart, "upload_task", None)
-            )
+
+            def _upload_done_callback(t: asyncio.Task) -> None:
+                try:
+                    t.result()
+                except FileUploadException as e:
+                    raise e
+                except Exception as e:
+                    raise FileUploadException(
+                        f"Error during file upload: {str(e)}"
+                    ) from e
+                finally:
+                    multipart.upload_task = None
+                    if upload_finished_event:
+                        upload_finished_event.set()
+
+            upload_task.add_done_callback(_upload_done_callback)
 
         return multipart.access_url
 
@@ -2014,10 +2096,12 @@ class FalFileRepositoryV3(FileRepository):
             self.upload_task = upload_task
 
             def _upload_done_callback(t: asyncio.Task) -> None:
-                t.result()
-                self.upload_task = None
-                if upload_finished_event:
-                    upload_finished_event.set()
+                try:
+                    t.result()
+                finally:
+                    self.upload_task = None
+                    if upload_finished_event:
+                        upload_finished_event.set()
 
             upload_task.add_done_callback(_upload_done_callback)
 
@@ -2196,7 +2280,7 @@ class InternalFalFileRepositoryV3(FileRepository):
         async def _prepare() -> tuple[str, str]:
             async with _maybe_retry_request_async(
                 request=httpx.Request(
-                    url=_FAL_CDN_V3 + "files/upload?async=1",
+                    url=_FAL_CDN_V3 + "/files/upload?async=1",
                     method="POST",
                     headers=headers,
                 )

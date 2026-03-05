@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from mimetypes import guess_extension, guess_type
 from pathlib import Path
@@ -96,18 +95,4 @@ class FileRepository:
         object_lifecycle_preference: Optional[dict[str, str]] = None,
         **kwargs,
     ) -> tuple[str, FileData | None]:
-        if multipart:
-            raise NotImplementedError()
-
-        with open(file_path, "rb") as fobj:
-            data_bytes = await asyncio.to_thread(fobj.read)
-            data = FileData(data_bytes, content_type, Path(file_path).name)
-
-        return await self.async_save(
-            data,
-            multipart=multipart,
-            multipart_threshold=multipart_threshold,
-            multipart_chunk_size=multipart_chunk_size,
-            multipart_max_concurrency=multipart_max_concurrency,
-            object_lifecycle_preference=object_lifecycle_preference,
-        ), data
+        raise NotImplementedError()
